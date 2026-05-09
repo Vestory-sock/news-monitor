@@ -95,4 +95,14 @@ def analyze_news(items: list[dict]) -> list[dict]:
         )
         text = resp.content[0].text
         scores = _parse_json_array(text)
-    exce
+    except Exception as e:
+        print(f"[analyzer] error: {e}")
+        return items  # nothing flagged -> nothing sent
+
+    by_id = {s.get("id"): s for s in scores if isinstance(s, dict)}
+
+    out = []
+    for item in items:
+        score = by_id.get(item["id"], {})
+        out.append({**item, **score})
+    return out

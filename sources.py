@@ -107,7 +107,7 @@ def fetch_sec_8k() -> list[dict]:
             "source": "SEC EDGAR",
             "url": entry.link,
             "published": published.isoformat(),
-            "tickers": [],
+            "tickers": [],  # ticker not in feed; Claude will infer from company name
         })
     print(f"[sec] {len(items)} fresh 8-K filings")
     return items
@@ -115,11 +115,17 @@ def fetch_sec_8k() -> list[dict]:
 
 # ---------- Generic RSS ----------
 RSS_FEEDS: list[tuple[str, str]] = [
+    # CNBC top news
     ("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"),
+    # MarketWatch top stories
     ("https://feeds.content.dowjones.io/public/rss/mw_topstories", "MarketWatch"),
+    # MarketWatch real-time headlines
     ("https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MarketWatch RT"),
+    # PR Newswire - press releases (where 8-K source material often appears first)
     ("https://www.prnewswire.com/rss/news-releases-list.rss", "PR Newswire"),
+    # Seeking Alpha market news
     ("https://seekingalpha.com/market_currents.xml", "Seeking Alpha"),
+    # Yahoo Finance top stories
     ("https://finance.yahoo.com/news/rssindex", "Yahoo Finance"),
 ]
 
@@ -155,14 +161,16 @@ def fetch_rss(url: str, source_name: str) -> list[dict]:
     return items
 
 
+# ---------- Aggregator ----------
 def fetch_all_news() -> list[dict]:
     items: list[dict] = []
     items.extend(fetch_finnhub_general())
     items.extend(fetch_sec_8k())
     for url, name in RSS_FEEDS:
         items.extend(fetch_rss(url, name))
-        time.sleep(0.3)
+        time.sleep(0.3)  # be polite
 
+    # Dedupe by URL just in case the same story is republished across sources
     seen_urls = set()
     deduped = []
     for it in items:
