@@ -107,7 +107,7 @@ def fetch_sec_8k() -> list[dict]:
             "source": "SEC EDGAR",
             "url": entry.link,
             "published": published.isoformat(),
-            "tickers": [],  # ticker not in feed; Claude will infer from company name
+            "tickers": [],
         })
     print(f"[sec] {len(items)} fresh 8-K filings")
     return items
@@ -115,21 +115,60 @@ def fetch_sec_8k() -> list[dict]:
 
 # ---------- Generic RSS ----------
 RSS_FEEDS: list[tuple[str, str]] = [
-    # CNBC top news
     ("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"),
-    # MarketWatch top stories
     ("https://feeds.content.dowjones.io/public/rss/mw_topstories", "MarketWatch"),
-    # MarketWatch real-time headlines
     ("https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MarketWatch RT"),
-    # PR Newswire - press releases (where 8-K source material often appears first)
     ("https://www.prnewswire.com/rss/news-releases-list.rss", "PR Newswire"),
-    # Seeking Alpha market news
     ("https://seekingalpha.com/market_currents.xml", "Seeking Alpha"),
-    # Yahoo Finance top stories
     ("https://finance.yahoo.com/news/rssindex", "Yahoo Finance"),
 ]
 
 
 def fetch_rss(url: str, source_name: str) -> list[dict]:
     try:
-        feed = feedparser.parse(url, request_headers={
+        feed = feedparser.parse(url, request_headers={"User-Agent": USER_AGENT})
+    except Exception as e:
+        print(f"[rss:{source_name}] error: {e}")
+        return []
+
+    items = []
+    cutoff = _cutoff()
+    for entry in feed.entries[:50]:
+        published = None
+        for key in ("published_parsed", "updated_parsed"):
+            tp = entry.get(key)
+            if tp:
+                published = datetime(*tp[:6], tzinfo=timezone.utc)
+                break
+        if not published or published < cutoff:
+            continue
+        items.append({
+            "id": _hid(source_name, entry.get("link", entry.get("id", entry.title))),
+            "headline": entry.title,
+            "summary": (entry.get("summary") or "")[:600],
+            "source": source_name,
+            "url": entry.get("link", ""),
+            "published": published.isoformat(),
+            "tickers": [],
+        })
+    print(f"[rss:{source_name}] {len(items)} fresh")
+    return items
+
+
+def fetch_all_news() -> list[dict]:
+    items: list[dict] = []
+    items.extend(fetch_finnhub_general())
+    items.extend(fetch_sec_8k())
+    for url, name in RSS_FEEDS:
+        items.extend(fetch_rss(url, name))
+        time.sleep(0.3)
+
+    seen_urls = set()
+    deduped = []
+    for it in items:
+        url = (it.get("url") or "").split("?")[0]
+        if url and url in seen_urls:
+            continue
+        seen_urls.add(url)
+        deduped.append(it)
+    return deduped
