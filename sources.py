@@ -1,131 +1,135 @@
-# Market News Monitor 📈
+"""
+News fetchers. Each function returns a list of dicts with fields:
+  id, headline, summary, source, url, published, tickers (list[str], may be empty)
 
-Monitor newsów giełdowych dla US stocks. Co 10 minut pobiera newsy z wielu źródeł, ocenia
-przez Claude API które z nich mogą krótkoterminowo ruszyć ceną konkretnej spółki, i wysyła
-alert na Telegram. Działa w GitHub Actions (darmowo, 24/7) — alerty przychodzą jak push na
-telefon z Telegrama.
+Sources used:
+  - Finnhub general market news API (free tier, requires FINNHUB_TOKEN)
+  - SEC EDGAR 8-K filings RSS (no key needed, official material event filings)
+  - Public business RSS feeds (CNBC, MarketWatch, PR Newswire)
+"""
+import os
+import hashlib
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Iterable
 
-## Co dostajesz w alercie
+import requests
+import feedparser
 
-```
-🟢 ↑  $TSLA  |  Urgency: 8/10 🔥🔥🔥🔥🔥🔥🔥🔥
+FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "").strip()
+USER_AGENT = "MarketNewsMonitor/1.0 (research; contact via repo)"
 
-Tesla Reports Q3 Deliveries Beat by 8%, Margins Expand
+# Items older than this are dropped at fetch time (cuts noise on first runs / sparse periods)
+MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "2"))
 
-💡 Beat consensus by ~8% on deliveries with margin expansion;
-   typical 5-10% gap up on similar prior surprises.
 
-📰 MarketWatch  |  otwórz
-🕐 2026-05-09T18:23:00+00:00
-```
+def _hid(*parts: str) -> str:
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
-## Co potrzebujesz (wszystko darmowe poza Claude API)
 
-1. **Konto GitHub** — bezpłatne
-2. **Klucz Claude API** — https://console.anthropic.com → Settings → API Keys
-   - Koszt: szacunkowo $5–15/miesiąc przy modelu Haiku (default), 144 uruchomień dziennie
-3. **Finnhub token** — https://finnhub.io/register, 60 req/min za darmo
-4. **Bot Telegrama** — utwórz przez `@BotFather`, weź token, napisz cokolwiek do bota,
-   otwórz `https://api.telegram.org/bot<TOKEN>/getUpdates` żeby znaleźć swoje `chat_id`
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-## Setup (15 minut)
 
-### 1. Stwórz repo na GitHub
+def _cutoff() -> datetime:
+    return _now() - timedelta(hours=MAX_AGE_HOURS)
 
-```bash
-# w folderze z plikami:
-git init
-git add .
-git commit -m "init"
-gh repo create news-monitor --private --source=. --push
-# albo zrób ręcznie: stwórz repo na github.com i wypchaj
-```
 
-**Repo MUSI być prywatne** (Twoje sekrety nie powinny wisieć publicznie, no i klucze API
-mimo że są w GitHub Secrets).
+# ---------- Finnhub ----------
+def fetch_finnhub_general() -> list[dict]:
+    if not FINNHUB_TOKEN:
+        print("[finnhub] no FINNHUB_TOKEN, skipping")
+        return []
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/news",
+            params={"category": "general", "token": FINNHUB_TOKEN},
+            timeout=15,
+            headers={"User-Agent": USER_AGENT},
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[finnhub] error: {e}")
+        return []
 
-### 2. Dodaj sekrety w GitHub
+    items = []
+    cutoff_ts = _cutoff().timestamp()
+    for n in data[:80]:
+        ts = n.get("datetime", 0)
+        if ts < cutoff_ts:
+            continue
+        related = n.get("related", "") or ""
+        tickers = [t.strip() for t in related.split(",") if t.strip()]
+        items.append({
+            "id": _hid("finnhub", str(n.get("id", "")), n.get("url", "")),
+            "headline": (n.get("headline") or "").strip(),
+            "summary": (n.get("summary") or "")[:600],
+            "source": n.get("source") or "Finnhub",
+            "url": n.get("url", ""),
+            "published": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+            "tickers": tickers,
+        })
+    print(f"[finnhub] {len(items)} fresh items")
+    return items
 
-W repo: `Settings → Secrets and variables → Actions → New repository secret`. Dodaj:
 
-| Nazwa sekretu | Wartość |
-|---|---|
-| `ANTHROPIC_API_KEY` | sk-ant-... |
-| `FINNHUB_TOKEN` | Twój Finnhub token |
-| `TELEGRAM_BOT_TOKEN` | token od @BotFather |
-| `TELEGRAM_CHAT_ID` | Twoje chat ID (liczba, możliwe że ujemna) |
+# ---------- SEC EDGAR 8-K ----------
+# 8-K = "current report" filed for material events (M&A, executive changes, bankruptcy,
+# earnings releases, regulation FD disclosures). Mandated by SEC -> price-moving by definition.
+def fetch_sec_8k() -> list[dict]:
+    url = (
+        "https://www.sec.gov/cgi-bin/browse-edgar"
+        "?action=getcompany&type=8-K&dateb=&owner=include&count=40&output=atom"
+    )
+    try:
+        feed = feedparser.parse(
+            url, request_headers={"User-Agent": USER_AGENT, "Accept": "application/atom+xml"}
+        )
+    except Exception as e:
+        print(f"[sec] error: {e}")
+        return []
 
-Opcjonalnie zmień próg pilności w `Settings → Variables → Actions`:
-- `URGENCY_THRESHOLD` (zmienna, nie sekret) = `6` (default), `7` lub `8`
+    items = []
+    cutoff = _cutoff()
+    for entry in feed.entries:
+        published = None
+        if entry.get("updated_parsed"):
+            published = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+        elif entry.get("published_parsed"):
+            published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        if not published or published < cutoff:
+            continue
+        items.append({
+            "id": _hid("sec", entry.get("id", entry.link)),
+            "headline": f"[SEC 8-K] {entry.title}",
+            "summary": (entry.get("summary") or "")[:600],
+            "source": "SEC EDGAR",
+            "url": entry.link,
+            "published": published.isoformat(),
+            "tickers": [],  # ticker not in feed; Claude will infer from company name
+        })
+    print(f"[sec] {len(items)} fresh 8-K filings")
+    return items
 
-### 3. Włącz workflow
 
-W repo: zakładka `Actions` → włącz workflows jeśli zapyta → uruchom ręcznie pierwszy raz
-(`News Monitor → Run workflow`) żeby sprawdzić czy działa.
+# ---------- Generic RSS ----------
+RSS_FEEDS: list[tuple[str, str]] = [
+    # CNBC top news
+    ("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"),
+    # MarketWatch top stories
+    ("https://feeds.content.dowjones.io/public/rss/mw_topstories", "MarketWatch"),
+    # MarketWatch real-time headlines
+    ("https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MarketWatch RT"),
+    # PR Newswire - press releases (where 8-K source material often appears first)
+    ("https://www.prnewswire.com/rss/news-releases-list.rss", "PR Newswire"),
+    # Seeking Alpha market news
+    ("https://seekingalpha.com/market_currents.xml", "Seeking Alpha"),
+    # Yahoo Finance top stories
+    ("https://finance.yahoo.com/news/rssindex", "Yahoo Finance"),
+]
 
-Patrz w logi — jeśli widzisz np. `[finnhub] 35 fresh items` i `[telegram] sent: ...`, działa.
 
-Po pierwszym ręcznym uruchomieniu, scheduler sam zacznie odpalać co 10 minut.
-
-## Lokalny test (opcjonalny)
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env  # i wypełnij
-export $(cat .env | xargs)
-python monitor.py
-```
-
-## Strojenie
-
-**Za dużo alertów?** Podnieś `URGENCY_THRESHOLD` do 7 lub 8.
-
-**Za mało alertów / pomija newsy?** Obniż threshold do 5, lub zmień model w
-`monitor.yml` na `claude-sonnet-4-6` (wyższa precyzja, ale ~5x droższy).
-
-**Chcesz inne źródła?** Edytuj `RSS_FEEDS` w `sources.py`. Możliwości:
-- Benzinga (płatne API, ale bardzo szybkie alerty traderskie)
-- Twitter/X (trudne — API kosztuje, scraping zablokowany)
-- Reddit r/wallstreetbets (`https://www.reddit.com/r/wallstreetbets/.json`)
-- Konkretne tickery z Finnhub: `/api/v1/company-news?symbol=AAPL&from=...&to=...`
-
-**Chcesz inny ton/styl analizy?** Edytuj prompt `SYSTEM` w `analyzer.py`.
-
-**Chcesz tylko określone tickery / sektory?** Dodaj filtr po `analyze_news` w `monitor.py`,
-np. `if not any(t in WATCHLIST for t in item["tickers"]): continue`.
-
-## Architektura
-
-```
-GitHub Actions (cron */10 * * * *)
-        ↓
-    monitor.py
-        ├── sources.py  ──→ Finnhub API + SEC EDGAR + RSS feeds
-        ├── state.py    ──→ state.json (jakie newsy już widziałem)
-        ├── analyzer.py ──→ Claude API (czy news ruszy ceną, jaki ticker)
-        └── notifier.py ──→ Telegram Bot API → push na telefon
-```
-
-## Ważne zastrzeżenia
-
-- **GitHub Actions cron jest "best effort"** — w praktyce uruchomienia mogą być opóźnione
-  o 1–15 min w godzinach szczytu. Jeśli potrzebujesz absolutnej punktualności,
-  rozważ Cloudflare Workers Cron Triggers (działa co do sekundy).
-- **Żaden filtr AI nie jest 100% trafny.** Claude czasami przepuści szum lub przeoczy
-  realny news. Zawsze waliduj przed kliknięciem buy/sell.
-- **Najszybsze newsy są płatne.** Bloomberg/Refinitiv/Benzinga Pro wyprzedzają darmowe
-  źródła o sekundy/minuty. Ten setup to "good enough free tier".
-- **Nie jest to porada inwestycyjna.** Trading na newsach na CFD to handel z dźwignią —
-  wiesz co robisz na własną odpowiedzialność.
-
-## Koszty (orientacyjnie)
-
-- GitHub Actions: **$0** (darmowy tier obejmuje 2000 min/mies dla repo prywatnego — Ty
-  zużyjesz ~30s × 144 = 72 min/dzień = ~2160 min/mies, czyli mieścisz się w cuglach;
-  *publiczne repo* ma nielimitowane minutes ale wtedy uważaj na sekrety)
-- Finnhub: **$0** (free tier wystarczy)
-- Telegram: **$0**
-- Claude API (Haiku): **~$5–15/mies** (zależy od liczby pobranych newsów; ~25 newsów × 144 runs/dzień)
-- Total: **~$5–15/mies**
+def fetch_rss(url: str, source_name: str) -> list[dict]:
+    try:
+        feed = feedparser.parse(url, request_headers={
