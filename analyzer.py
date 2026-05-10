@@ -1,15 +1,16 @@
 """
-Claude-powered news analyzer.
-Sends a batch of news items to Claude, gets back per-item market-impact scores.
-Uses Haiku 4.5 by default - fast and cheap, plenty good for headline classification.
+Gemini-powered news analyzer (replaces Anthropic Claude version).
+Sends a batch of news items to Gemini, gets back per-item market-impact scores.
+Uses Gemini 2.5 Flash by default - free tier, plenty good for headline classification.
 """
 import os
 import json
 import re
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 
-_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 SYSTEM = """You are a financial news triage analyst for a short-term CFD trader.
 
@@ -42,12 +43,11 @@ Output ONLY a valid JSON array. No prose, no markdown fences. Schema:
   {
     "id": "<exact id from input>",
     "market_moving": true|false,
-    "tickers": ["AAPL", "MSFT"],   // US tickers only; [] if unclear or not a stock
+    "tickers": ["AAPL", "MSFT"],
     "direction": "up"|"down"|"unclear",
-    "urgency": 1-10,                // 10 = halt-the-stock level (FDA decision, M&A, fraud)
+    "urgency": 1-10,
     "reason": "one short sentence explaining the trade thesis"
-  },
-  ...
+  }
 ]
 
 Be strict. If unsure, set market_moving=false. False positives waste the trader's attention.
@@ -56,11 +56,9 @@ Be strict. If unsure, set market_moving=false. False positives waste the trader'
 
 def _parse_json_array(text: str) -> list[dict]:
     text = text.strip()
-    # Strip markdown fences if Claude added them despite instructions
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
-    # Find the first [ and last ] if there's prose around
     start = text.find("[")
     end = text.rfind("]")
     if start != -1 and end != -1 and end > start:
@@ -87,17 +85,21 @@ def analyze_news(items: list[dict]) -> list[dict]:
     user_msg = "Analyze these news items:\n\n" + json.dumps(payload, ensure_ascii=False)
 
     try:
-        resp = _client.messages.create(
+        resp = _client.models.generate_content(
             model=MODEL,
-            max_tokens=4096,
-            system=SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
+            contents=user_msg,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM,
+                temperature=0.0,
+                max_output_tokens=8192,
+                response_mime_type="application/json",
+            ),
         )
-        text = resp.content[0].text
+        text = resp.text
         scores = _parse_json_array(text)
     except Exception as e:
         print(f"[analyzer] error: {e}")
-        return items  # nothing flagged -> nothing sent
+        return items
 
     by_id = {s.get("id"): s for s in scores if isinstance(s, dict)}
 
