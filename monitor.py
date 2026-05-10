@@ -1,6 +1,6 @@
 """
 News monitor - runs once per cron tick.
-Fetches news -> dedupes -> scores via Claude -> sends Telegram alerts for high-impact items.
+Fetches news -> dedupes -> scores via Gemini -> enriches with context -> sends Telegram alerts.
 """
 import os
 import sys
@@ -8,8 +8,8 @@ from sources import fetch_all_news
 from analyzer import analyze_news
 from notifier import send_telegram_alert
 from state import load_seen, save_seen
+from enrichment import enrich_alert
 
-# Minimalna pilność (1-10), powyżej której wysyłamy alert. Zacznij od 6, podkręć do 7-8 jeśli za dużo szumu.
 URGENCY_THRESHOLD = int(os.getenv("URGENCY_THRESHOLD", "6"))
 
 
@@ -25,12 +25,11 @@ def main() -> int:
         save_seen(seen)
         return 0
 
-    # Mark all as seen FIRST (before scoring), so a crash later doesn't resend duplicates next run
+    # Mark all as seen first - prevents duplicate alerts if a later step crashes
     for item in new_items:
         seen.add(item["id"])
     save_seen(seen)
 
-    # Score with Claude (in batches to keep token usage reasonable)
     BATCH = 25
     sent = 0
     for i in range(0, len(new_items), BATCH):
@@ -41,7 +40,10 @@ def main() -> int:
                 continue
             if int(item.get("urgency", 0)) < URGENCY_THRESHOLD:
                 continue
-            send_telegram_alert(item)
+
+            # Enrich only items that pass the urgency filter (saves Finnhub calls)
+            enriched = enrich_alert(item)
+            send_telegram_alert(enriched)
             sent += 1
 
     print(f"[monitor] sent {sent} alerts")

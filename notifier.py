@@ -1,4 +1,4 @@
-"""Telegram notifier."""
+"""Telegram notifier with enriched context (session timing, move assessment)."""
 import os
 import html
 import requests
@@ -30,18 +30,41 @@ def send_telegram_alert(item: dict) -> None:
     reason = html.escape(item.get("reason", ""))
     source = html.escape(item.get("source", ""))
     url = item.get("url", "")
-    published = html.escape(item.get("published", ""))
 
-    text = (
-        f"{arrow}  <b>{ticker_line}</b>  |  Urgency: <b>{urgency}/10</b> {fire}\n\n"
-        f"<b>{headline}</b>\n\n"
-    )
+    session = item.get("session") or {}
+    session_emoji = session.get("emoji", "")
+    session_label = session.get("label", "")
+    session_note = session.get("note", "")
+
+    move_assessment = item.get("move_assessment")
+    ticker_context = item.get("ticker_context") or {}
+    current_price = ticker_context.get("current_price")
+
+    # Header line
+    text = f"{arrow}  <b>{ticker_line}</b>  |  Urgency: <b>{urgency}/10</b> {fire}\n"
+
+    # Session line
+    if session_label:
+        text += f"{session_emoji} <b>{session_label}</b>: {html.escape(session_note)}\n"
+
+    # Headline
+    text += f"\n<b>{headline}</b>\n\n"
+
+    # AI thesis
     if reason:
-        text += f"💡 <i>{reason}</i>\n\n"
-    text += f"📰 {source}"
+        text += f"💡 <i>{reason}</i>\n"
+
+    # Ticker context
+    if move_assessment:
+        text += f"📊 {html.escape(move_assessment)}"
+        if current_price:
+            text += f"  |  cena ${current_price}"
+        text += "\n"
+
+    # Footer
+    text += f"\n📰 {source}"
     if url:
         text += f"  |  <a href=\"{url}\">otwórz</a>"
-    text += f"\n🕐 {published}"
 
     try:
         r = requests.post(
