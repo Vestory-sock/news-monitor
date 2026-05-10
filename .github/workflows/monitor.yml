@@ -2,7 +2,7 @@ name: News Monitor
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -35,7 +35,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           URGENCY_THRESHOLD: ${{ vars.URGENCY_THRESHOLD || '6' }}
-          MAX_AGE_HOURS: '2'
+          MAX_AGE_MINUTES: '10'
         run: python monitor.py
 
       - name: Commit updated state
