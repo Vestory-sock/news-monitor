@@ -1,26 +1,25 @@
 """
-News fetchers. Each function returns a list of dicts with fields:
-  id, headline, summary, source, url, published, tickers (list[str], may be empty)
+News fetchers - BREAKING NEWS ONLY edition.
 
-Sources used:
-  - Finnhub general market news API (free tier, requires FINNHUB_TOKEN)
-  - SEC EDGAR 8-K filings RSS (no key needed, official material event filings)
-  - Public business RSS feeds (CNBC, MarketWatch, PR Newswire)
+Strict freshness: items older than MAX_AGE_MINUTES (default 10) are dropped.
+Only primary sources (press release wires + SEC) and fastest media feeds.
+
+Each function returns a list of dicts with fields:
+  id, headline, summary, source, url, published, tickers (list[str], may be empty)
 """
 import os
 import hashlib
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Iterable
 
 import requests
 import feedparser
 
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "").strip()
-USER_AGENT = "MarketNewsMonitor/1.0 (research; contact via repo)"
+USER_AGENT = "MarketNewsMonitor/2.0 (research; personal use)"
 
-# Items older than this are dropped at fetch time (cuts noise on first runs / sparse periods)
-MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "2"))
+# Strict freshness filter - items older than this are discarded BEFORE Gemini sees them
+MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", "10"))
 
 
 def _hid(*parts: str) -> str:
@@ -32,13 +31,13 @@ def _now() -> datetime:
 
 
 def _cutoff() -> datetime:
-    return _now() - timedelta(hours=MAX_AGE_HOURS)
+    return _now() - timedelta(minutes=MAX_AGE_MINUTES)
 
 
-# ---------- Finnhub ----------
+# ---------- Finnhub general news ----------
 def fetch_finnhub_general() -> list[dict]:
     if not FINNHUB_TOKEN:
-        print("[finnhub] no FINNHUB_TOKEN, skipping")
+        print("[finnhub] no token, skipping")
         return []
     try:
         r = requests.get(
@@ -70,13 +69,12 @@ def fetch_finnhub_general() -> list[dict]:
             "published": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
             "tickers": tickers,
         })
-    print(f"[finnhub] {len(items)} fresh items")
+    print(f"[finnhub] {len(items)} fresh")
     return items
 
 
-# ---------- SEC EDGAR 8-K ----------
-# 8-K = "current report" filed for material events (M&A, executive changes, bankruptcy,
-# earnings releases, regulation FD disclosures). Mandated by SEC -> price-moving by definition.
+# ---------- SEC EDGAR 8-K filings ----------
+# Regulatory filings for material corporate events - mandatory and immediate
 def fetch_sec_8k() -> list[dict]:
     url = (
         "https://www.sec.gov/cgi-bin/browse-edgar"
@@ -84,7 +82,8 @@ def fetch_sec_8k() -> list[dict]:
     )
     try:
         feed = feedparser.parse(
-            url, request_headers={"User-Agent": USER_AGENT, "Accept": "application/atom+xml"}
+            url,
+            request_headers={"User-Agent": USER_AGENT, "Accept": "application/atom+xml"},
         )
     except Exception as e:
         print(f"[sec] error: {e}")
@@ -107,26 +106,30 @@ def fetch_sec_8k() -> list[dict]:
             "source": "SEC EDGAR",
             "url": entry.link,
             "published": published.isoformat(),
-            "tickers": [],  # ticker not in feed; Claude will infer from company name
+            "tickers": [],
         })
     print(f"[sec] {len(items)} fresh 8-K filings")
     return items
 
 
-# ---------- Generic RSS ----------
+# ---------- Press release wires + fastest media (BREAKING ONLY) ----------
 RSS_FEEDS: list[tuple[str, str]] = [
-    # CNBC top news
-    ("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"),
-    # MarketWatch top stories
-    ("https://feeds.content.dowjones.io/public/rss/mw_topstories", "MarketWatch"),
-    # MarketWatch real-time headlines
-    ("https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MarketWatch RT"),
-    # PR Newswire - press releases (where 8-K source material often appears first)
+    # PR Newswire - press releases from listed US companies (real-time)
     ("https://www.prnewswire.com/rss/news-releases-list.rss", "PR Newswire"),
-    # Seeking Alpha market news
-    ("https://seekingalpha.com/market_currents.xml", "Seeking Alpha"),
-    # Yahoo Finance top stories
-    ("https://finance.yahoo.com/news/rssindex", "Yahoo Finance"),
+    # GlobeNewswire - press releases from public companies (real-time)
+    (
+        "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire+-+News+for+Public+Companies",
+        "GlobeNewswire",
+    ),
+    # Business Wire - Berkshire Hathaway's press release wire (real-time)
+    ("https://feed.businesswire.com/rss/home/?rss=G1QFDLJxkRJUWGla", "Business Wire"),
+    # MarketWatch real-time breaking headlines (NOT "top stories" which is mixed)
+    (
+        "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
+        "MarketWatch RT",
+    ),
+    # CNBC top news - mostly real-time
+    ("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"),
 ]
 
 
@@ -135,6 +138,10 @@ def fetch_rss(url: str, source_name: str) -> list[dict]:
         feed = feedparser.parse(url, request_headers={"User-Agent": USER_AGENT})
     except Exception as e:
         print(f"[rss:{source_name}] error: {e}")
+        return []
+
+    if not feed.entries:
+        print(f"[rss:{source_name}] no entries (feed may be down)")
         return []
 
     items = []
@@ -161,16 +168,15 @@ def fetch_rss(url: str, source_name: str) -> list[dict]:
     return items
 
 
-# ---------- Aggregator ----------
 def fetch_all_news() -> list[dict]:
     items: list[dict] = []
     items.extend(fetch_finnhub_general())
     items.extend(fetch_sec_8k())
     for url, name in RSS_FEEDS:
         items.extend(fetch_rss(url, name))
-        time.sleep(0.3)  # be polite
+        time.sleep(0.3)
 
-    # Dedupe by URL just in case the same story is republished across sources
+    # Dedupe by URL
     seen_urls = set()
     deduped = []
     for it in items:

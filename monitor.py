@@ -1,6 +1,12 @@
 """
-News monitor - runs once per cron tick.
-Fetches news -> dedupes -> scores via Gemini -> enriches with context -> sends Telegram alerts.
+News monitor - BREAKING NEWS ONLY edition.
+
+Hard filters applied in this order:
+  1. Source-level freshness (sources.py - MAX_AGE_MINUTES)
+  2. AI must mark market_moving=true
+  3. Direction must be 'up' or 'down' (no 'unclear')
+  4. Must have at least one ticker
+  5. Urgency must meet URGENCY_THRESHOLD
 """
 import os
 import sys
@@ -11,6 +17,22 @@ from state import load_seen, save_seen
 from enrichment import enrich_alert
 
 URGENCY_THRESHOLD = int(os.getenv("URGENCY_THRESHOLD", "6"))
+
+
+def passes_quality_filter(item: dict) -> tuple[bool, str]:
+    """Returns (passes, reason_if_rejected) for diagnostics."""
+    if not item.get("market_moving"):
+        return False, "not market_moving"
+    direction = item.get("direction")
+    if direction not in ("up", "down"):
+        return False, f"direction not clear ({direction})"
+    tickers = item.get("tickers") or []
+    if not tickers:
+        return False, "no ticker"
+    urgency = int(item.get("urgency", 0))
+    if urgency < URGENCY_THRESHOLD:
+        return False, f"urgency {urgency} below threshold {URGENCY_THRESHOLD}"
+    return True, ""
 
 
 def main() -> int:
@@ -25,28 +47,29 @@ def main() -> int:
         save_seen(seen)
         return 0
 
-    # Mark all as seen first - prevents duplicate alerts if a later step crashes
+    # Mark all as seen first - prevents duplicate alerts on later crashes
     for item in new_items:
         seen.add(item["id"])
     save_seen(seen)
 
     BATCH = 25
     sent = 0
+    rejected = 0
     for i in range(0, len(new_items), BATCH):
         batch = new_items[i : i + BATCH]
         analyzed = analyze_news(batch)
         for item in analyzed:
-            if not item.get("market_moving"):
-                continue
-            if int(item.get("urgency", 0)) < URGENCY_THRESHOLD:
+            ok, reason = passes_quality_filter(item)
+            if not ok:
+                rejected += 1
                 continue
 
-            # Enrich only items that pass the urgency filter (saves Finnhub calls)
+            # Enrich only items that passed all filters (saves Finnhub calls)
             enriched = enrich_alert(item)
             send_telegram_alert(enriched)
             sent += 1
 
-    print(f"[monitor] sent {sent} alerts")
+    print(f"[monitor] sent {sent} alerts, rejected {rejected} items")
     return 0
 
 

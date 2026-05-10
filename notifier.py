@@ -1,4 +1,4 @@
-"""Telegram notifier with enriched context (session timing, move assessment)."""
+"""Telegram notifier - Polish labels, enriched context."""
 import os
 import html
 import requests
@@ -9,7 +9,6 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DIRECTION_EMOJI = {
     "up": "🟢 ↑",
     "down": "🔴 ↓",
-    "unclear": "⚪ ?",
 }
 
 
@@ -18,8 +17,8 @@ def send_telegram_alert(item: dict) -> None:
         print("[telegram] BOT_TOKEN/CHAT_ID not configured, skipping send")
         return
 
-    direction = item.get("direction", "unclear")
-    arrow = DIRECTION_EMOJI.get(direction, "⚪ ?")
+    direction = item.get("direction", "up")
+    arrow = DIRECTION_EMOJI.get(direction, "🟢 ↑")
     urgency = int(item.get("urgency", 0))
     fire = "🔥" * min(urgency, 10)
 
@@ -40,28 +39,22 @@ def send_telegram_alert(item: dict) -> None:
     ticker_context = item.get("ticker_context") or {}
     current_price = ticker_context.get("current_price")
 
-    # Header line
-    text = f"{arrow}  <b>{ticker_line}</b>  |  Urgency: <b>{urgency}/10</b> {fire}\n"
+    text = f"{arrow}  <b>{ticker_line}</b>  |  Pilność: <b>{urgency}/10</b> {fire}\n"
 
-    # Session line
     if session_label:
         text += f"{session_emoji} <b>{session_label}</b>: {html.escape(session_note)}\n"
 
-    # Headline
     text += f"\n<b>{headline}</b>\n\n"
 
-    # AI thesis
     if reason:
         text += f"💡 <i>{reason}</i>\n"
 
-    # Ticker context
     if move_assessment:
         text += f"📊 {html.escape(move_assessment)}"
         if current_price:
             text += f"  |  cena ${current_price}"
         text += "\n"
 
-    # Footer
     text += f"\n📰 {source}"
     if url:
         text += f"  |  <a href=\"{url}\">otwórz</a>"
