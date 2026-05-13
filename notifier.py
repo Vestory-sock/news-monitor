@@ -1,4 +1,4 @@
-"""Telegram notifier - Polish labels, enriched context."""
+"""Telegram notifier - Phase 1: Polish labels, enriched context, paper gains warning."""
 import os
 import html
 import requests
@@ -39,10 +39,17 @@ def send_telegram_alert(item: dict) -> None:
     ticker_context = item.get("ticker_context") or {}
     current_price = ticker_context.get("current_price")
 
+    is_paper_gains = bool(item.get("is_paper_gains"))
+
+    # Build alert message
     text = f"{arrow}  <b>{ticker_line}</b>  |  Pilność: <b>{urgency}/10</b> {fire}\n"
 
     if session_label:
         text += f"{session_emoji} <b>{session_label}</b>: {html.escape(session_note)}\n"
+
+    # Paper gains warning - prominent yellow flag
+    if is_paper_gains:
+        text += f"⚠️ <b>UWAGA:</b> Księgowy zysk (nie cash) - rynek może słabo reagować\n"
 
     text += f"\n<b>{headline}</b>\n\n"
 
